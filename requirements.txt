@@ -1,0 +1,27 @@
+# ============================================
+# RAG 项目依赖
+# ============================================
+
+# --- 文档加载 ---
+PyPDF2>=3.0.0          # PDF 解析
+python-docx>=1.0.0     # Word 文档解析
+markdown>=3.5.0        # Markdown 解析
+
+# --- 文本切分 ---
+langchain-text-splitters>=0.2.0
+
+# --- 向量化（免费本地模型）---
+sentence-transformers>=2.5.0
+
+# --- 向量数据库 ---
+chromadb>=0.4.0
+
+# --- LLM 调用 ---
+openai>=1.0.0
+
+# --- Web UI ---
+streamlit>=1.30.0
+
+# --- 工具 ---
+python-dotenv>=1.0.0   # 环境变量管理
+tiktoken>=0.5.0        # Token 计数

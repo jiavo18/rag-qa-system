@@ -1,0 +1,24 @@
+# 环境变量（包含 API Key，绝对不能提交）
+.env
+
+# 向量数据库文件（本地数据）
+chroma_db/
+
+# 上传的文档
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
