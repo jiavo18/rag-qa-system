@@ -96,7 +96,7 @@ with st.sidebar:
         value=default_key,
         type="password",
         placeholder="sk-...",
-        help="从 https://platform.openai.com/api-keys 获取",
+        help="从 platform.deepseek.com/api_keys 获取（或其他兼容 API）",
     )
     base_url = st.text_input(
         "API Base URL（可选）",
@@ -138,6 +138,7 @@ with st.sidebar:
                 for uploaded_file in uploaded_files:
                     # 保存临时文件
                     suffix = Path(uploaded_file.name).suffix
+                    os.makedirs("./data", exist_ok=True)  # 确保目录存在
                     with tempfile.NamedTemporaryFile(
                         delete=False, suffix=suffix, dir="./data"
                     ) as tmp_file:
@@ -262,7 +263,7 @@ if question := st.chat_input(
                     stream=True,
                     api_key=st.session_state.get("api_key"),
                     base_url=st.session_state.get("base_url"),
-                    model=st.session_state.get("model", "gpt-3.5-turbo"),
+                    model=st.session_state.get("model", "deepseek-chat"),
                 )
 
                 for item in generator:
