@@ -1,7 +1,7 @@
 # 📚 RAG 文档问答系统
 
 > **Retrieval-Augmented Generation** — 基于检索增强生成的智能文档问答系统  
-> 暑期实习项目 · 面试准备版
+> 🌐 在线体验：**[jiavo18-rag--system.streamlit.app](https://jiavo18-rag--system.streamlit.app/)**
 
 ---
 
