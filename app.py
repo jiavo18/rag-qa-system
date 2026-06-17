@@ -22,6 +22,7 @@ from src.pipeline import RAGPipeline
 from src.loader import load_document
 from src.chunker import chunk_text
 from src.auth import register_user, login_user, verify_token, get_user_by_id
+from src.conversation import get_conversation_manager
 
 # ============================================
 # 页面配置
@@ -70,7 +71,9 @@ if "pipeline" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "kb_ready" not in st.session_state:
-    st.session_state.kb_ready = False
+    # 检查向量库是否已有数据（处理刷新后状态丢失）
+    _pipeline = RAGPipeline(persist_dir="./chroma_db")
+    st.session_state.kb_ready = _pipeline.vector_store.get_count() > 0
 if "ingested_files" not in st.session_state:
     st.session_state.ingested_files = []
 if "user" not in st.session_state:
@@ -94,6 +97,8 @@ with st.sidebar:
                 st.session_state.user = None
                 st.session_state.token = None
                 st.session_state.messages = []
+                st.session_state.pipeline = None  # 重置管道，切换回公开知识库
+                st.session_state.kb_ready = False
                 st.rerun()
         else:
             tab1, tab2 = st.tabs(["登录", "注册"])
@@ -106,6 +111,8 @@ with st.sidebar:
                         user_id = verify_token(token)
                         st.session_state.token = token
                         st.session_state.user = get_user_by_id(user_id)
+                        st.session_state.pipeline = None  # 强制重建，使用新用户的隔离库
+                        st.session_state.kb_ready = False
                         st.rerun()
                     else:
                         st.error("用户名或密码错误")
@@ -155,12 +162,18 @@ with st.sidebar:
         st.session_state.base_url = "https://api.deepseek.com/v1"  # 默认 DeepSeek
     st.session_state.model = "deepseek-chat"
 
-    # 首次使用时初始化管道（登录用户按 user_id 隔离知识库）
+    # 按当前用户初始化管道（用户隔离）
+    current_user_id = st.session_state.user["id"] if st.session_state.user else None
     if not st.session_state.pipeline:
-        user_id = st.session_state.user["id"] if st.session_state.user else None
         st.session_state.pipeline = RAGPipeline(
             persist_dir="./chroma_db",
-            user_id=user_id,
+            user_id=current_user_id,
+        )
+    elif getattr(st.session_state.pipeline, 'user_id', None) != current_user_id:
+        # 用户切换了，重建管道
+        st.session_state.pipeline = RAGPipeline(
+            persist_dir="./chroma_db",
+            user_id=current_user_id,
         )
 
     st.divider()
@@ -229,6 +242,40 @@ with st.sidebar:
 
     st.divider()
 
+    # --- 对话管理 ---
+    st.header("💬 对话")
+    cm = get_conversation_manager()
+    sessions = cm.list_sessions(
+        user_id=st.session_state.user["id"] if st.session_state.user else None
+    )
+
+    session_options = {"(新对话)": None}
+    for s in sessions:
+        label = s["title"] or s["id"]
+        session_options[label] = s["id"]
+
+    selected_label = st.selectbox(
+        "选择对话",
+        options=list(session_options.keys()),
+        key="session_selector",
+        help="切换或创建新对话，同一个对话里 AI 会记住上下文",
+    )
+    selected_session = session_options[selected_label]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("➕ 新对话", use_container_width=True):
+            new_id = cm.create_session(
+                user_id=st.session_state.user["id"] if st.session_state.user else None
+            )
+            st.session_state.session_selector = "(新对话)"
+            st.rerun()
+    with col2:
+        if selected_session and st.button("🗑️ 删除", use_container_width=True):
+            cm.delete_session(selected_session)
+            st.session_state.session_selector = "(新对话)"
+            st.rerun()
+
     # --- 检索设置 ---
     st.header("🔍 检索设置")
     top_k = st.slider(
@@ -236,8 +283,12 @@ with st.sidebar:
         min_value=1,
         max_value=10,
         value=4,
-        help="每次从知识库中取回的文档片段数量。值越大上下文越丰富，但也可能引入噪声"
+        help="每次从知识库中取回的文档片段数量",
     )
+    use_hybrid = st.checkbox("混合检索 (BM25+向量)", value=True,
+        help="同时用关键词和语义搜索，召回更全")
+    use_rerank = st.checkbox("Rerank 重排序", value=True,
+        help="Cross-Encoder 二次精排，结果更准（需下载模型 ~1GB）")
 
     st.divider()
 
@@ -309,6 +360,9 @@ if question := st.chat_input(
                     api_key=st.session_state.get("api_key"),
                     base_url=st.session_state.get("base_url"),
                     model=st.session_state.get("model", "deepseek-chat"),
+                    session_id=selected_session,
+                    use_hybrid=use_hybrid,
+                    use_rerank=use_rerank,
                 )
 
                 for item in generator:

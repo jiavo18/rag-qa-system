@@ -329,8 +329,13 @@ async def list_sessions(user_id: Optional[int] = Depends(get_current_user)):
 
 
 @app.delete("/session/{session_id}", tags=["对话管理"])
-async def delete_session(session_id: str):
-    """删除指定对话及其所有消息"""
+async def delete_session(
+    session_id: str,
+    user_id: Optional[int] = Depends(get_current_user),
+):
+    """删除指定对话及其所有消息（需登录）"""
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="请先登录")
     cm = get_conversation_manager()
     cm.delete_session(session_id)
     return {"message": f"对话 {session_id} 已删除"}
