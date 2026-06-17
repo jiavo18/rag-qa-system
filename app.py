@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.pipeline import RAGPipeline
 from src.loader import load_document
 from src.chunker import chunk_text
+from src.auth import register_user, login_user, verify_token, get_user_by_id
 
 # ============================================
 # 页面配置
@@ -72,6 +73,10 @@ if "kb_ready" not in st.session_state:
     st.session_state.kb_ready = False
 if "ingested_files" not in st.session_state:
     st.session_state.ingested_files = []
+if "user" not in st.session_state:
+    st.session_state.user = None  # 当前登录用户
+if "token" not in st.session_state:
+    st.session_state.token = None
 
 
 
@@ -80,6 +85,42 @@ if "ingested_files" not in st.session_state:
 # ============================================
 with st.sidebar:
     st.title("⚙️ 配置")
+
+    # --- 用户登录 ---
+    with st.expander("👤 账户", expanded=st.session_state.user is None):
+        if st.session_state.user:
+            st.success(f"已登录: **{st.session_state.user['username']}**")
+            if st.button("退出登录", use_container_width=True):
+                st.session_state.user = None
+                st.session_state.token = None
+                st.session_state.messages = []
+                st.rerun()
+        else:
+            tab1, tab2 = st.tabs(["登录", "注册"])
+            with tab1:
+                login_username = st.text_input("用户名", key="login_user")
+                login_password = st.text_input("密码", type="password", key="login_pass")
+                if st.button("登录", use_container_width=True, key="btn_login"):
+                    token = login_user(login_username, login_password)
+                    if token:
+                        user_id = verify_token(token)
+                        st.session_state.token = token
+                        st.session_state.user = get_user_by_id(user_id)
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误")
+            with tab2:
+                reg_username = st.text_input("用户名", key="reg_user")
+                reg_password = st.text_input("密码", type="password", key="reg_pass")
+                if st.button("注册", use_container_width=True, key="btn_reg"):
+                    try:
+                        user = register_user(reg_username, reg_password)
+                        if user:
+                            st.success(f"注册成功! 请登录")
+                        else:
+                            st.error("用户名已存在")
+                    except ValueError as e:
+                        st.error(str(e))
 
     # --- API 配置 ---
     st.header("🔑 API 设置")
@@ -114,9 +155,13 @@ with st.sidebar:
         st.session_state.base_url = "https://api.deepseek.com/v1"  # 默认 DeepSeek
     st.session_state.model = "deepseek-chat"
 
-    # 首次使用时初始化管道
+    # 首次使用时初始化管道（登录用户按 user_id 隔离知识库）
     if not st.session_state.pipeline:
-        st.session_state.pipeline = RAGPipeline(persist_dir="./chroma_db")
+        user_id = st.session_state.user["id"] if st.session_state.user else None
+        st.session_state.pipeline = RAGPipeline(
+            persist_dir="./chroma_db",
+            user_id=user_id,
+        )
 
     st.divider()
 
