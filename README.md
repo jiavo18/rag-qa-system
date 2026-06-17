@@ -68,6 +68,18 @@ streamlit run app.py
 
 浏览器访问 `http://localhost:8501` 即可使用。
 
+### Docker 一键部署
+
+```bash
+# 构建镜像
+docker build -t rag-qa-system .
+
+# 启动容器
+docker run -p 8000:8000 rag-qa-system
+```
+
+访问 `http://localhost:8000/docs` 查看 API 文档。
+
 ### 4. 使用流程
 
 1. 在左侧边栏输入 OpenAI API Key

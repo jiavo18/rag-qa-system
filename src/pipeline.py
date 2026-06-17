@@ -21,6 +21,9 @@ from .embedder import embed_texts
 from .vector_store import VectorStore
 from .retriever import retrieve
 from .generator import generate_answer, generate_answer_stream
+from .conversation import get_conversation_manager
+from .hybrid_retriever import BM25Index, hybrid_search
+from .reranker import rerank
 
 
 class RAGPipeline:
@@ -37,6 +40,7 @@ class RAGPipeline:
         self,
         persist_dir: str = "./chroma_db",
         collection_name: str = "rag_documents",
+        user_id: Optional[int] = None,
     ):
         """
         初始化 RAG 管道
@@ -45,11 +49,26 @@ class RAGPipeline:
             persist_dir: 向量数据库持久化目录
             collection_name: 集合名称
         """
+        # 用户隔离：不同用户使用不同 collection
+        self.user_id = user_id
+        if user_id:
+            collection_name = f"rag_user_{user_id}_{collection_name}"
+
         self.vector_store = VectorStore(
             persist_dir=persist_dir,
             collection_name=collection_name,
         )
         self.documents: List[str] = []  # 已处理的文件列表
+        self.bm25_index = BM25Index()  # BM25 关键词索引
+        # 从已有数据重建 BM25 索引
+        self._rebuild_bm25_index()
+
+    def _rebuild_bm25_index(self):
+        """从向量库重建 BM25 索引"""
+        if self.vector_store.get_count() > 0:
+            data = self.vector_store.collection.get(include=["documents"])
+            if data["documents"]:
+                self.bm25_index.build(data["documents"])
 
     def ingest(self, file_path: str) -> Dict:
         """
@@ -93,6 +112,9 @@ class RAGPipeline:
         print(f"💾 [4/4] 存储到向量数据库...")
         count = self.vector_store.add_documents(chunks, embeddings, file_name)
 
+        # Step 5: 重建 BM25 索引
+        self._rebuild_bm25_index()
+
         self.documents.append(file_name)
 
         result = {
@@ -115,11 +137,14 @@ class RAGPipeline:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: str = "deepseek-chat",
+        session_id: Optional[str] = None,
+        use_hybrid: bool = True,
+        use_rerank: bool = True,
     ) -> Generator:
         """
         问答流程
 
-        流程：embed 问题 → 检索 → 生成答案
+        流程：取历史 → embed 问题 → 检索 → 生成答案 → 存对话
 
         Args:
             question: 用户问题
@@ -128,6 +153,7 @@ class RAGPipeline:
             api_key: OpenAI API Key
             base_url: API Base URL
             model: 使用的模型
+            session_id: 对话 ID（多轮对话支持）
 
         Yields:
             生成的内容（流式或非流式）
@@ -137,38 +163,81 @@ class RAGPipeline:
             yield "⚠️ 知识库为空，请先上传文档。"
             return
 
-        # Step 1: 检索
-        print(f"🔍 检索中: \"{question}\"")
-        context_chunks = retrieve(
-            query=question,
-            vector_store=self.vector_store,
-            top_k=top_k,
-        )
+        # Step 0: 获取对话历史（多轮对话）
+        history = None
+        cm = get_conversation_manager()
+        if session_id:
+            history = cm.get_history(session_id)
+
+        # Step 1: 检索（向量 / 混合）
+        method = "混合检索" if use_hybrid else "向量检索"
+        print(f"🔍 检索中 [{method}]: \"{question}\"")
+        if use_hybrid:
+            context_chunks = hybrid_search(
+                query=question,
+                vector_store=self.vector_store,
+                bm25_index=self.bm25_index,
+                top_k=top_k * 2 if use_rerank else top_k,
+            )
+        else:
+            context_chunks = retrieve(
+                query=question,
+                vector_store=self.vector_store,
+                top_k=top_k * 2 if use_rerank else top_k,
+            )
+
+        # Step 1.5: Rerank（可选）
+        if use_rerank and context_chunks:
+            print(f"🔄 Rerank 重排序: {len(context_chunks)} → {top_k}")
+            context_chunks = rerank(
+                query=question,
+                candidates=context_chunks,
+                top_k=top_k,
+            )
+            if context_chunks:
+                print(f"   重排后 top{len(context_chunks)}")
 
         if not context_chunks:
             yield "⚠️ 未找到相关内容，请尝试换个问法或上传更多相关文档。"
             return
 
-        print(f"   找到 {len(context_chunks)} 个相关片段")
+        print(f"   找到 {len(context_chunks)} 个相关片段"
+              + (f" (对话历史: {len(history)} 条)" if history else ""))
 
-        # Step 2: 生成（流式）
+        # Step 2: 记录用户问题
+        if session_id:
+            cm.add_message(session_id, "user", question)
+
+        # Step 3: 生成
+        full_answer = ""
         if stream:
-            yield from generate_answer_stream(
+            for chunk in generate_answer_stream(
                 query=question,
                 context_chunks=context_chunks,
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
-            )
+                history=history,
+            ):
+                if isinstance(chunk, str):
+                    full_answer += chunk
+                yield chunk
         else:
-            answer = generate_answer(
+            full_answer = generate_answer(
                 query=question,
                 context_chunks=context_chunks,
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
+                history=history,
             )
-            yield answer
+            yield full_answer
+
+        # Step 4: 记录助手回答
+        if session_id and full_answer:
+            # 去掉来源引用脚注再存储
+            clean_answer = full_answer.split("\n\n---\n")[0]
+            cm.add_message(session_id, "assistant", clean_answer)
 
         # 附加上下文信息（供 UI 展示）
         yield ("__CONTEXT__", context_chunks)

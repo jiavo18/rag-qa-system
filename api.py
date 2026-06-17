@@ -17,10 +17,11 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # 确保 src 在路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,6 +30,8 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from src.pipeline import RAGPipeline
+from src.conversation import get_conversation_manager
+from src.auth import register_user, login_user, verify_token, get_user_by_id
 
 # ============================================
 # 应用初始化
@@ -48,19 +51,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局 Pipeline 单例（首次使用时初始化）
-_pipeline: Optional[RAGPipeline] = None
+# 用户管道缓存（按 user_id 隔离）
+_pipelines: dict = {}
+_default_pipeline: Optional[RAGPipeline] = None
 
 
-def get_pipeline() -> RAGPipeline:
-    """获取全局 RAG 管道（延迟初始化，Singleton）"""
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = RAGPipeline(
-            persist_dir="./chroma_db",
-            collection_name="rag_documents",
-        )
-    return _pipeline
+def get_pipeline(user_id: Optional[int] = None) -> RAGPipeline:
+    """获取 RAG 管道（按 user_id 隔离知识库）"""
+    global _default_pipeline
+    if user_id is not None:
+        if user_id not in _pipelines:
+            _pipelines[user_id] = RAGPipeline(
+                persist_dir="./chroma_db",
+                collection_name="rag_documents",
+                user_id=user_id,
+            )
+        return _pipelines[user_id]
+    else:
+        if _default_pipeline is None:
+            _default_pipeline = RAGPipeline(
+                persist_dir="./chroma_db",
+                collection_name="rag_documents",
+            )
+        return _default_pipeline
 
 
 # ============================================
@@ -72,6 +85,9 @@ class QueryRequest(BaseModel):
     api_key: str = Field(..., description="API Key（DeepSeek / OpenAI）")
     base_url: Optional[str] = Field(None, description="API Base URL")
     model: str = Field("deepseek-chat", description="模型名称")
+    session_id: Optional[str] = Field(None, description="对话 ID（多轮对话，可选）")
+    use_hybrid: bool = Field(True, description="是否启用混合检索")
+    use_rerank: bool = Field(True, description="是否启用 Rerank 重排序")
 
 
 class QueryResponse(BaseModel):
@@ -94,11 +110,30 @@ class UploadResponse(BaseModel):
 
 
 # ============================================
+# 认证辅助
+# ============================================
+security = HTTPBearer(auto_error=False)
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[int]:
+    """从 Bearer Token 中提取 user_id（可选认证，未登录返回 None）"""
+    if credentials is None:
+        return None
+    user_id = verify_token(credentials.credentials)
+    return user_id
+
+
+# ============================================
 # API 端点
 # ============================================
 
 @app.post("/upload", response_model=UploadResponse, tags=["文档管理"])
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: Optional[int] = Depends(get_current_user),
+):
     """
     上传文档并处理入库
 
@@ -128,7 +163,7 @@ async def upload_document(file: UploadFile = File(...)):
 
     # 处理入库
     try:
-        pipeline = get_pipeline()
+        pipeline = get_pipeline(user_id)
         result = pipeline.ingest(save_path)
         return UploadResponse(**result)
     except ValueError as e:
@@ -138,7 +173,10 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.post("/query", tags=["问答"])
-async def ask_question(req: QueryRequest):
+async def ask_question(
+    req: QueryRequest,
+    user_id: Optional[int] = Depends(get_current_user),
+):
     """
     向知识库提问（流式返回 SSE）
 
@@ -148,7 +186,7 @@ async def ask_question(req: QueryRequest):
 
     面试要点: SSE 流式输出 — 用户不用等完整答案，逐字出现
     """
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(user_id)
 
     if pipeline.vector_store.get_count() == 0:
         raise HTTPException(status_code=400, detail="知识库为空，请先上传文档")
@@ -164,6 +202,9 @@ async def ask_question(req: QueryRequest):
                 api_key=req.api_key,
                 base_url=req.base_url,
                 model=req.model,
+                session_id=req.session_id,
+                use_hybrid=req.use_hybrid,
+                use_rerank=req.use_rerank,
             )
 
             for item in generator:
@@ -195,19 +236,104 @@ async def ask_question(req: QueryRequest):
 
 
 @app.get("/stats", response_model=StatsResponse, tags=["知识库"])
-async def get_stats():
+async def get_stats(user_id: Optional[int] = Depends(get_current_user)):
     """查看知识库统计信息"""
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(user_id)
     stats = pipeline.get_stats()
     return StatsResponse(**stats)
 
 
 @app.delete("/clear", tags=["知识库"])
-async def clear_knowledge_base():
+async def clear_knowledge_base(user_id: Optional[int] = Depends(get_current_user)):
     """清空知识库"""
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(user_id)
     pipeline.clear_knowledge_base()
     return {"message": "知识库已清空", "total_chunks": 0}
+
+
+# ============================================
+# 认证端点
+# ============================================
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=4, max_length=100)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/register", tags=["认证"])
+async def api_register(req: RegisterRequest):
+    """注册新用户"""
+    try:
+        user = register_user(req.username, req.password)
+        if user is None:
+            raise HTTPException(status_code=409, detail="用户名已存在")
+        return {"message": "注册成功", "user": user}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/login", tags=["认证"])
+async def api_login(req: LoginRequest):
+    """登录，返回 JWT Token"""
+    token = login_user(req.username, req.password)
+    if token is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    user_id = verify_token(token)
+    user = get_user_by_id(user_id)
+    return {
+        "message": "登录成功",
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.get("/me", tags=["认证"])
+async def api_me(user_id: Optional[int] = Depends(get_current_user)):
+    """获取当前登录用户信息"""
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="请先登录（Header: Authorization: Bearer <token>）")
+    user = get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"user": user}
+
+
+# ============================================
+# 对话管理端点（多轮对话）
+# ============================================
+
+@app.post("/session", tags=["对话管理"])
+async def create_session(user_id: Optional[int] = Depends(get_current_user)):
+    """
+    创建新对话，返回 session_id
+
+    后续在 POST /query 中传入 session_id 即可实现多轮对话
+    """
+    cm = get_conversation_manager()
+    session_id = cm.create_session(user_id=user_id)
+    return {"session_id": session_id, "message": "对话已创建"}
+
+
+@app.get("/sessions", tags=["对话管理"])
+async def list_sessions(user_id: Optional[int] = Depends(get_current_user)):
+    """列出对话（登录用户只看自己的）"""
+    cm = get_conversation_manager()
+    sessions = cm.list_sessions(user_id=user_id)
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+@app.delete("/session/{session_id}", tags=["对话管理"])
+async def delete_session(session_id: str):
+    """删除指定对话及其所有消息"""
+    cm = get_conversation_manager()
+    cm.delete_session(session_id)
+    return {"message": f"对话 {session_id} 已删除"}
 
 
 # ============================================

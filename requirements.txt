@@ -24,6 +24,14 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 python-multipart>=0.0.6
 
+# --- 混合检索 ---
+rank-bm25>=0.2.0
+jieba>=0.42.0
+
+# --- 用户认证 ---
+PyJWT>=2.0.0
+bcrypt>=4.0.0
+
 # --- Web UI ---
 streamlit>=1.30.0
 
